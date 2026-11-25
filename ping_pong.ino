@@ -4,13 +4,19 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 
-#define LED_1 PD4
-#define LED_2 PD5
-#define BOTAO_1 PD2
-#define BOTAO_2 PD3
-#define POTENCIOMETRO PC0
+//LIGACOES (CONFERIDAS NO TINKERCAD)
+#define LED_1 PD4 //LED VERDE (JOGADOR 1)
+#define LED_2 PD5 //LED AMARELO (JOGADOR 2)
+#define BOTAO_1 PD2 //INT0
+#define BOTAO_2 PD3 //INT1
+#define POTENCIOMETRO PC0 //A0
 
-#define PONTUACAO_LIMITE 30
+//LCD 16x2 NO MODO 4 BITS: D4-D7 NOS PINOS 8-11 (PB0-PB3)
+#define LCD_RS PB4 //PINO 12
+#define LCD_E PB5 //PINO 13
+#define LCD_DADOS 0x0F //MASCARA DE PB0 A PB3
+
+#define PONTUACAO_LIMITE 10
 #define DEBOUNCE_MS 50
 
 #define BAUD 9600
@@ -56,6 +62,8 @@ uint32_t lerTempo(){
   return t;
 }
 
+//ESPERA PELO TIMER (SEM _delay_ms). COMO O CONTADOR E DE 1ms,
+//ESPERAR "ms" GARANTE PELO MENOS ms-1 MILISSEGUNDOS
 void esperaMs(uint32_t ms){
   uint32_t inicio = lerTempo();
   while(lerTempo() - inicio < ms);
@@ -95,6 +103,123 @@ void uartEnviaPlacar(uint8_t p1, uint8_t p2){
   uartEnviaNumero(p2);
 }
 
+//---------------- LCD ----------------
+//MANDA 4 BITS PRO LCD E DA UM PULSO NO ENABLE
+void lcdEnviaNibble(uint8_t nibble){
+  PORTB = (PORTB & ~LCD_DADOS) | (nibble & LCD_DADOS);
+  PORTB |= (1 << LCD_E);
+  esperaMs(2);
+  PORTB &= ~(1 << LCD_E);
+  esperaMs(2);
+}
+
+//MANDA 1 BYTE EM DUAS PARTES: PRIMEIRO OS 4 BITS DE CIMA, DEPOIS OS DE BAIXO
+//rs = 0 -> COMANDO, rs = 1 -> CARACTERE
+void lcdEnviaByte(uint8_t valor, uint8_t rs){
+  if(rs) PORTB |= (1 << LCD_RS);
+  else PORTB &= ~(1 << LCD_RS);
+  lcdEnviaNibble(valor >> 4);
+  lcdEnviaNibble(valor & 0x0F);
+}
+
+void lcdComando(uint8_t comando){
+  lcdEnviaByte(comando, 0);
+}
+
+void lcdEscreveChar(char c){
+  lcdEnviaByte(c, 1);
+}
+
+void lcdEscreveTexto(const char *texto){
+  while(*texto) lcdEscreveChar(*texto++);
+}
+
+//ESCREVE UM NUMERO SEMPRE COM 2 DIGITOS (EX: 07)
+void lcdEscreve2Digitos(uint8_t n){
+  lcdEscreveChar('0' + (n / 10) % 10);
+  lcdEscreveChar('0' + n % 10);
+}
+
+//POSICIONA O CURSOR (linha 0 OU 1, coluna 0 A 15)
+void lcdCursor(uint8_t linha, uint8_t coluna){
+  lcdComando(0x80 | ((linha ? 0x40 : 0x00) + coluna));
+}
+
+void lcdLimpa(){
+  lcdComando(0x01);
+  esperaMs(3); //O COMANDO DE LIMPAR DEMORA MAIS (1,52ms)
+}
+
+//SEQUENCIA DE INICIALIZACAO DO LCD (HD44780) NO MODO 4 BITS,
+//COM OS TEMPOS DO DATASHEET
+void configuracaoLCD(){
+  DDRB |= LCD_DADOS | (1 << LCD_RS) | (1 << LCD_E); //PINOS DO LCD COMO SAIDA
+  PORTB &= ~(LCD_DADOS | (1 << LCD_RS) | (1 << LCD_E)); //RS = 0 -> COMANDOS
+  esperaMs(100); //ESPERA O LCD LIGAR (MINIMO 40ms)
+
+  lcdEnviaNibble(0x03);
+  esperaMs(6); //MINIMO 4,1ms
+  lcdEnviaNibble(0x03);
+  esperaMs(2);
+  lcdEnviaNibble(0x03);
+  esperaMs(2);
+  lcdEnviaNibble(0x02); //ENTRA NO MODO 4 BITS
+  esperaMs(2);
+
+  lcdComando(0x28); //4 BITS, 2 LINHAS, FONTE 5x8
+  lcdComando(0x0C); //DISPLAY LIGADO, SEM CURSOR
+  lcdComando(0x06); //CURSOR ANDA PRA DIREITA
+  lcdLimpa();
+}
+
+//TELA DE CONFIGURACAO: DESENHA A TELA INTEIRA UMA VEZ SO
+void telaConfiguracao(uint8_t pontuacaoMaxima){
+  lcdLimpa();
+  lcdEscreveTexto("PLACAR PINGPONG");
+  lcdCursor(1, 0);
+  lcdEscreveTexto("Ate ");
+  lcdEscreve2Digitos(pontuacaoMaxima);
+  lcdEscreveTexto(" pontos");
+}
+
+//QUANDO O POTENCIOMETRO MUDA, REESCREVE SO O NUMERO (SEM LIMPAR A TELA, NAO PISCA)
+void telaAtualizaMaxima(uint8_t pontuacaoMaxima){
+  lcdCursor(1, 4);
+  lcdEscreve2Digitos(pontuacaoMaxima);
+}
+
+//TELA DO JOGO: "J1 05 x 03 J2" NA LINHA 1, SAQUE E TEMPO NA LINHA 2
+void telaPlacar(uint8_t p1, uint8_t p2, uint8_t sacador){
+  lcdCursor(0, 0);
+  lcdEscreveTexto("J1 ");
+  lcdEscreve2Digitos(p1);
+  lcdEscreveTexto(" x ");
+  lcdEscreve2Digitos(p2);
+  lcdEscreveTexto(" J2  ");
+  lcdCursor(1, 0);
+  lcdEscreveTexto("Saque:J");
+  lcdEscreveChar('0' + sacador);
+}
+
+//ATUALIZA SO O TEMPO DE PARTIDA (mm:ss) NO CANTO DA LINHA 2
+void telaTempo(uint32_t segundos){
+  lcdCursor(1, 11);
+  lcdEscreve2Digitos(segundos / 60);
+  lcdEscreveChar(':');
+  lcdEscreve2Digitos(segundos % 60);
+}
+
+void telaFimDeJogo(uint8_t vencedor, uint8_t p1, uint8_t p2){
+  lcdLimpa();
+  lcdEscreveTexto("VENCEDOR: J");
+  lcdEscreveChar('0' + vencedor);
+  lcdCursor(1, 0);
+  lcdEscreveTexto("Final: ");
+  lcdEscreve2Digitos(p1);
+  lcdEscreveTexto(" x ");
+  lcdEscreve2Digitos(p2);
+}
+
 //---------------- LEDS ----------------
 //ACENDE O LED DE QUEM ESTA SACANDO
 void acendeSacador(uint8_t jogador){
@@ -107,20 +232,18 @@ void acendeSacador(uint8_t jogador){
   }
 }
 
-//TROCA O SACADOR A CADA 2 PONTOS. NO DESEMPATE (OS DOIS A 1 PONTO
-//DE FECHAR O JOGO) O SAQUE TROCA A CADA PONTO, COMO NA REGRA OFICIAL.
-void alternaSacador(uint8_t p1, uint8_t p2, uint8_t pontuacaoMaxima){
+//DESCOBRE QUEM SACA: TROCA A CADA 2 PONTOS, NAO IMPORTA QUEM FEZ.
+//0-1 PONTOS: J1 | 2-3 PONTOS: J2 | 4-5 PONTOS: J1 ...
+uint8_t calculaSacador(uint8_t p1, uint8_t p2){
   uint8_t total = p1 + p2;
-  uint8_t desempate = (p1 >= pontuacaoMaxima - 1) && (p2 >= pontuacaoMaxima - 1);
-  uint8_t trocas = desempate ? total : total / 2;
-  acendeSacador((trocas % 2 == 0) ? 1 : 2);
+  return ((total / 2) % 2 == 0) ? 1 : 2;
 }
 
 //PISCA O LED DO VENCEDOR QUANDO O JOGO ACABA
 void sinalizaFimDeJogo(uint8_t vencedor){
   uint8_t led = (vencedor == 1) ? (1 << LED_1) : (1 << LED_2);
   PORTD &= ~((1 << LED_1) | (1 << LED_2));
-  for(uint8_t i = 0; i < 3; i++){
+  for(uint8_t i = 0; i < 5; i++){
     PORTD |= led;
     esperaMs(300);
     PORTD &= ~led;
@@ -154,9 +277,26 @@ uint16_t leituraADC(){
   return leitura;
 }
 
-//TRANSFORMA A LEITURA DO POTENCIOMETRO EM UMA PONTUACAO DE 1 A 30
+//FAZ A MEDIA DE 16 LEITURAS PRA DIMINUIR O RUIDO DO POTENCIOMETRO
+uint16_t leituraADCMedia(){
+  uint32_t soma = 0;
+  for(uint8_t i = 0; i < 16; i++) soma += leituraADC();
+  return soma / 16;
+}
+
+//TRANSFORMA A LEITURA DO POTENCIOMETRO (0 A 1023) EM UMA PONTUACAO DE 1 A 10.
+//HISTERESE: SO ACEITA UMA LEITURA NOVA SE ELA MUDAR MAIS DE HISTERESE_ADC
+//EM RELACAO A ULTIMA ACEITA. ASSIM O VALOR NAO FICA PULANDO ENTRE DOIS NUMEROS.
+#define HISTERESE_ADC 25
+uint16_t adcAceito = 0xFFFF; //0xFFFF = AINDA NAO LEU NADA
+
 uint8_t lerPontuacaoMaxima(){
-  return 1 + ((uint32_t)leituraADC() * (PONTUACAO_LIMITE - 1)) / 1023;
+  uint16_t leitura = leituraADCMedia();
+  int16_t diferenca = (int16_t)leitura - (int16_t)adcAceito;
+  if(adcAceito == 0xFFFF || diferenca > HISTERESE_ADC || diferenca < -HISTERESE_ADC){
+    adcAceito = leitura;
+  }
+  return 1 + ((uint32_t)adcAceito * PONTUACAO_LIMITE) / 1024;
 }
 
 //PEGA E LIMPA A FLAG DE PONTO COM AS INTERRUPCOES DESLIGADAS
@@ -171,7 +311,7 @@ uint8_t pegaPonto(volatile uint8_t *flag){
 int main(void){
   DDRD |= (1 << LED_1) | (1 << LED_2); //LEDS COMO SAIDA
   DDRD &= ~((1 << BOTAO_1) | (1 << BOTAO_2)); //BOTOES COMO ENTRADA
-  PORTD &= ~((1 << BOTAO_1) | (1 << BOTAO_2)); //SEM PULL-UP INTERNO (PRECISA DE PULL-DOWN EXTERNO)
+  PORTD &= ~((1 << BOTAO_1) | (1 << BOTAO_2)); //SEM PULL-UP INTERNO (TEM PULL-DOWN EXTERNO)
   DDRC &= ~(1 << POTENCIOMETRO); //POTENCIOMETRO COMO ENTRADA
 
   configuracaoTimer();
@@ -180,10 +320,18 @@ int main(void){
   configuracaoUART();
   sei();
 
+  //MENSAGENS DE DIAGNOSTICO: SE A SEGUNDA NAO APARECER, O PROGRAMA
+  //TRAVOU NO esperaMs() (OU SEJA, O TIMER NAO ESTA FUNCIONANDO)
+  uartEnviaTexto("\r\nIniciando LCD...\r\n");
+  configuracaoLCD(); //DEPOIS DO sei() PORQUE O LCD USA O esperaMs()
+  uartEnviaTexto("LCD pronto\r\n");
+
   Estado estado = CONFIGURACAO;
   uint8_t p1 = 0, p2 = 0;
   uint8_t pontuacaoMaxima = 0;
   uint8_t vencedor = 0;
+  uint32_t inicioPartida = 0;
+  uint32_t ultimoSegundo = 0;
 
   uartEnviaTexto("\r\n=== PLACAR DE PING-PONG ===\r\n");
   acendeSacador(1);
@@ -195,6 +343,9 @@ int main(void){
       case CONFIGURACAO: {
         uint8_t novaMaxima = lerPontuacaoMaxima();
         if(novaMaxima != pontuacaoMaxima){
+          //pontuacaoMaxima == 0 -> ACABOU DE ENTRAR NA CONFIGURACAO: DESENHA A TELA TODA
+          if(pontuacaoMaxima == 0) telaConfiguracao(novaMaxima);
+          else telaAtualizaMaxima(novaMaxima);
           pontuacaoMaxima = novaMaxima;
           uartEnviaTexto("Pontuacao da partida: ");
           uartEnviaNumero(pontuacaoMaxima);
@@ -203,36 +354,52 @@ int main(void){
         //O PRIMEIRO PONTO COMECA O JOGO
         if(pontoPendente1 || pontoPendente2){
           uartEnviaTexto("Partida iniciada!\r\n");
+          inicioPartida = lerTempo();
+          ultimoSegundo = 0;
+          lcdLimpa();
+          telaPlacar(0, 0, 1);
+          telaTempo(0);
           estado = JOGANDO;
         }
         break;
       }
 
       case JOGANDO: {
+        //UM PONTO POR VEZ: SE OS DOIS APERTAREM JUNTO, O OUTRO FICA PRA PROXIMA VOLTA
         uint8_t marcou = 0;
         if(pegaPonto(&pontoPendente1)){ p1++; marcou = 1; }
-        if(pegaPonto(&pontoPendente2)){ p2++; marcou = 2; }
+        else if(pegaPonto(&pontoPendente2)){ p2++; marcou = 2; }
+
+        uint32_t segundos = (lerTempo() - inicioPartida) / 1000;
 
         if(marcou){
           //LOG DE CADA PONTO NO TERMINAL SERIAL
           uartEnviaTexto("[");
-          uartEnviaNumero(lerTempo() / 1000);
+          uartEnviaNumero(segundos);
           uartEnviaTexto("s] Ponto do jogador ");
           uartEnviaNumero(marcou);
           uartEnviaTexto(" | Placar: ");
           uartEnviaPlacar(p1, p2);
           uartEnviaTexto("\r\n");
 
-          //ACABA QUANDO ALGUEM CHEGA NA PONTUACAO COM 2 PONTOS DE VANTAGEM
-          if(p1 >= pontuacaoMaxima && p1 >= p2 + 2){
+          //ACABA QUANDO ALGUEM CHEGA NA PONTUACAO MAXIMA
+          if(p1 >= pontuacaoMaxima){
             vencedor = 1;
             estado = FIM_DE_JOGO;
-          } else if(p2 >= pontuacaoMaxima && p2 >= p1 + 2){
+          } else if(p2 >= pontuacaoMaxima){
             vencedor = 2;
             estado = FIM_DE_JOGO;
           } else {
-            alternaSacador(p1, p2, pontuacaoMaxima);
+            uint8_t sacador = calculaSacador(p1, p2);
+            acendeSacador(sacador);
+            telaPlacar(p1, p2, sacador);
           }
+        }
+
+        //ATUALIZA O RELOGIO DA TELA UMA VEZ POR SEGUNDO
+        if(estado == JOGANDO && segundos != ultimoSegundo){
+          ultimoSegundo = segundos;
+          telaTempo(segundos);
         }
         break;
       }
@@ -244,14 +411,15 @@ int main(void){
         uartEnviaPlacar(p1, p2);
         uartEnviaTexto("\r\n\r\n");
 
-        sinalizaFimDeJogo(vencedor);
+        telaFimDeJogo(vencedor, p1, p2);
+        sinalizaFimDeJogo(vencedor); //PISCA 5 VEZES (3 SEGUNDOS) COM O RESULTADO NA TELA
 
-        //ZERA TUDO PRO JOGO NOVO (IGNORA TOQUES FEITOS DURANTE O PISCA-PISCA)
+        //ZERA TUDO PRO JOGO NOVO (IGNORA TOQUES FEITOS NO FIM DE JOGO)
         p1 = 0;
         p2 = 0;
         pegaPonto(&pontoPendente1);
         pegaPonto(&pontoPendente2);
-        pontuacaoMaxima = 0; //FORCA MOSTRAR A PONTUACAO DE NOVO
+        pontuacaoMaxima = 0; //FORCA MOSTRAR A TELA DE CONFIGURACAO DE NOVO
         acendeSacador(1); //JOGADOR 1 SACA NO JOGO NOVO
         estado = CONFIGURACAO;
         break;
